@@ -17,6 +17,25 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using StackExchange.Redis;
 
+if (args is ["--provider"])
+{
+    await RenewalAvailabilityRunner.RunProviderAsync();
+    return;
+}
+if (args.Length != 1 || !int.TryParse(args[0], out _))
+{
+    try
+    {
+        Environment.ExitCode = await RenewalAvailabilityRunner.RunAsync(args);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Harness failure ({ex.GetType().Name}): {ex.Message}");
+        Environment.ExitCode = 2;
+    }
+    return;
+}
+
 var count = int.Parse(args[0]);
 var connection = Environment.GetEnvironmentVariable("REPRO_REDIS") ?? "redis:6379";
 ProbeJob.SameKey = Environment.GetEnvironmentVariable("REPRO_SAME_KEY") == "1";
