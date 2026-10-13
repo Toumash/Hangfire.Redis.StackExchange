@@ -1,5 +1,6 @@
 using System;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Collections.Generic;
 using Hangfire.Redis.StackExchange;
 using Hangfire.Common;
@@ -67,6 +68,15 @@ namespace Hangfire.Redis.Tests
                         Interlocked.Decrement(ref active);
                     }
                 });
+            var pending = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            database.Setup(db => db.LockExtendAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(),
+                It.IsAny<TimeSpan>(), It.IsAny<CommandFlags>())).Returns(async () =>
+                {
+                    if (Interlocked.Increment(ref active) > 1) overlap.Set();
+                    entered.Set();
+                    try { return await pending.Task.ConfigureAwait(false); }
+                    finally { Interlocked.Decrement(ref active); }
+                });
             var lease = RedisLock.Acquire(database.Object, "pending-renewal", TimeSpan.FromSeconds(1),
                 TimeSpan.FromMilliseconds(200));
             try
@@ -78,6 +88,7 @@ namespace Hangfire.Redis.Tests
             {
                 lease.Dispose();
                 release.Set();
+                pending.TrySetResult(true);
                 Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref active) == 0, TimeSpan.FromSeconds(5)));
             }
         }
@@ -150,6 +161,11 @@ namespace Hangfire.Redis.Tests
         [InlineData(false)]
         [InlineData(true)]
         public void LostRenewalOnlyFailsAJobThatIsStillProcessing(bool alreadySucceeded)
+        {
+            AssertJobStateAfterLoss(alreadySucceeded);
+        }
+
+        private static void AssertJobStateAfterLoss(bool alreadySucceeded)
         {
             var redis = RedisUtils.CreateClient();
             var storage = new RedisStorage(RedisUtils.GetHostAndPort(),
@@ -280,6 +296,33 @@ namespace Hangfire.Redis.Tests
             }
         }
 
+        [Fact, CleanRedis]
+        public void FailurePublicationExceptionDoesNotStopLaterNotifications()
+        {
+            var redis = RedisUtils.CreateClient();
+            var failedPublication = new ManualResetEventSlim();
+            var unavailableStorage = new Mock<JobStorage>();
+            unavailableStorage.Setup(storage => storage.GetConnection()).Returns(() =>
+            {
+                failedPublication.Set();
+                throw new TimeoutException("Simulated state storage failure.");
+            });
+            var job = Job.FromExpression(() => RenewalTestJob.Execute());
+            var subscriber = new HangfireSubscriber();
+            subscriber.OnPerforming(new PerformingContext(new PerformContext(unavailableStorage.Object,
+                new Mock<Hangfire.Storage.IStorageConnection>().Object,
+                new BackgroundJob("unavailable", job, DateTime.UtcNow), new Mock<IJobCancellationToken>().Object)));
+            using (var lease = RedisLock.Acquire(redis, "notification-error", TimeSpan.FromSeconds(1),
+                TimeSpan.FromMilliseconds(200)))
+            {
+                redis.KeyDelete("notification-error");
+                Assert.True(failedPublication.Wait(TimeSpan.FromSeconds(5)));
+            }
+            subscriber.OnPerformed(null);
+            // Exercise a second real performing job after the publisher has observed an exception.
+            AssertJobStateAfterLoss(false);
+        }
+
         private static IDatabase CreateRenewalDatabase(Func<bool> renewal)
         {
             var database = new Mock<IDatabase>();
@@ -289,6 +332,8 @@ namespace Hangfire.Redis.Tests
                 It.IsAny<CommandFlags>())).Returns(true);
             database.Setup(db => db.LockExtend(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(),
                 It.IsAny<TimeSpan>(), It.IsAny<CommandFlags>())).Returns(renewal);
+            database.Setup(db => db.LockExtendAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(),
+                It.IsAny<TimeSpan>(), It.IsAny<CommandFlags>())).Returns(() => Task.FromResult(renewal()));
             return database.Object;
         }
 
@@ -325,6 +370,16 @@ namespace Hangfire.Redis.Tests
                             Interlocked.Increment(ref _lostCalls);
                             Lost.Set();
                         }
+                        return extended;
+                    });
+                database.Setup(db => db.LockExtendAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(),
+                    It.IsAny<TimeSpan>(), It.IsAny<CommandFlags>()))
+                    .Returns(async (RedisKey key, RedisValue owner, TimeSpan duration, CommandFlags flags) =>
+                    {
+                        if (Volatile.Read(ref _cleanup) != 0) return true;
+                        BeforeExtend?.Invoke();
+                        var extended = await redis.LockExtendAsync(key, owner, duration, flags).ConfigureAwait(false);
+                        if (!extended) { Interlocked.Increment(ref _lostCalls); Lost.Set(); }
                         return extended;
                     });
                 Database = database.Object;
