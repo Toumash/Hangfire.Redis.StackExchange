@@ -18,6 +18,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Threading;
+using System.Threading.Tasks;
+using Hangfire.Logging;
 using Hangfire.Annotations;
 using Hangfire.Server;
 using Hangfire.States;
@@ -29,6 +31,7 @@ namespace Hangfire.Redis.StackExchange
     internal class RedisLock : IDisposable
     {
         private static readonly TimeSpan DefaultHoldDuration = TimeSpan.FromSeconds(30);
+        private static readonly ILog Logger = LogProvider.For<RedisLock>();
         private static readonly string OwnerId = Guid.NewGuid().ToString();
 
 
@@ -81,12 +84,16 @@ namespace Hangfire.Redis.StackExchange
             if (_isDisposed || _renewalStopped || Interlocked.CompareExchange(ref _renewalRunning, 1, 0) != 0)
                 return;
 
+            _ = ExtendLockAsync((StateBag)state);
+        }
+
+        private async Task ExtendLockAsync(StateBag stateBag)
+        {
             try
             {
                 // Disposal or a terminal failure may race with entering the callback.
                 if (_isDisposed || _renewalStopped) return;
 
-                var stateBag = (StateBag)state;
                 Exception redisEx = null;
                 bool lockSuccesfullyExtended = false;
                 int retryCount = 10;
@@ -94,7 +101,8 @@ namespace Hangfire.Redis.StackExchange
                 {
                     try
                     {
-                        lockSuccesfullyExtended = _redis.LockExtend(_key, OwnerId, stateBag.TimeSpan);
+                        lockSuccesfullyExtended = await _redis.LockExtendAsync(_key, OwnerId, stateBag.TimeSpan)
+                            .ConfigureAwait(false);
                         // False means this owner lost the lock; repeating renewal cannot recover it.
                         break;
                     }
@@ -102,7 +110,7 @@ namespace Hangfire.Redis.StackExchange
                     {
                         redisEx = ex;
                         if (_isDisposed) return;
-                        Thread.Sleep(3000);
+                        await Task.Delay(3000).ConfigureAwait(false);
                         retryCount--;
                     }
                 }
@@ -114,13 +122,17 @@ namespace Hangfire.Redis.StackExchange
                     // Scheduler/storage locks do not have a performing job context.
                     if (stateBag.PerformingContext == null) return;
 
-                    new BackgroundJobClient(stateBag.PerformingContext.Storage)
-                        .ChangeState(
-                            stateBag.PerformingContext.BackgroundJob.Id,
-                            new FailedState(new Exception($"Unable to extend a distributed lock with Key {_key} and OwnerId {OwnerId}", redisEx)),
-                            ProcessingState.StateName
-                        );
+                    var context = stateBag.PerformingContext;
+                    RedisLockFailureNotifier.TryNotify(context.Storage, context.BackgroundJob.Id,
+                        new Exception($"Unable to extend a distributed lock with Key {_key} and OwnerId {OwnerId}", redisEx),
+                        () => _isDisposed);
                 }
+            }
+            catch (Exception ex)
+            {
+                // Observe failures of the storage state transition, including Redis timeouts.
+                // A timer callback must never terminate the process with an unhandled exception.
+                Logger.ErrorException("Unable to record distributed lock renewal failure.", ex);
             }
             finally
             {
