@@ -63,3 +63,29 @@ provider-only probe is deliberately smaller than the original application host: 
 EF/parser workload, production-capacity proof or evidence of the historical OOM cause. Lock cancellation
 is cooperative and does not fence arbitrary business side effects. The notification queue is bounded,
 best effort and non-durable; saturation/storage errors are logged and do not replay jobs.
+
+
+### Verified results (2026-10-13 UTC)
+
+| Phase | Workers | Persisted results / Succeeded | Active metrics timeouts | Assertion |
+| --- | ---: | ---: | ---: | --- |
+| RED, provider `7769814` | 40 | 40 / 40 | 6 | failed (exit 1) |
+| RED, provider `7769814` | 80 | 80 / 80 | 19 | failed (exit 1) |
+| GREEN, async renewal + isolated publication | 40 | 40 / 40 | 0 | passed (exit 0) |
+| GREEN, async renewal + isolated publication | 80 | 80 / 80 | 0 | passed (exit 0) |
+
+RED is a health-availability regression even though business jobs eventually finish: both counts alone
+would miss the failure. The first metrics failures were observed while all corresponding owner keys remained valid.
+Tests ran on Linux ARM64, 2 CPUs / 1000 MiB, .NET 10.0.300, default MinWorkers=2 / MinIO=1, real Redis 8.4.
+The SDK image was pinned locally to build image SHA256
+`bd5c728837498c12c5e487a218cbe80f07c73f0db4433c87a90691d558c91946`; it is a local image, not a public image
+required by this test. For portable reproduction use the public SDK image argument shown above.
+
+The REFACTOR step extracts a shared job-state assertion from the xUnit theory so the publication-error test
+can reuse the behavior without calling another test method. It changes no provider behavior. After refactoring,
+the standalone feedback loop and complete xUnit suite are rerun; the verified outcomes are recorded with the branch.
+
+After the REFACTOR step, 40/40 and 80/80 still save results and reach Succeeded with zero active metrics timeouts.
+The separate mass-loss control at 40/80 reports all Failed, zero saved results/duplicates, exactly one start per job,
+and zero active metrics timeouts. The complete upstream xUnit suite passes **108 / 108, 0 failed, 0 skipped**
+against isolated Redis 7. These results were verified on 2026-10-13 and do not imply a production deployment.

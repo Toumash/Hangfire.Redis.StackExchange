@@ -162,6 +162,11 @@ namespace Hangfire.Redis.Tests
         [InlineData(true)]
         public void LostRenewalOnlyFailsAJobThatIsStillProcessing(bool alreadySucceeded)
         {
+            AssertJobStateAfterLoss(alreadySucceeded);
+        }
+
+        private static void AssertJobStateAfterLoss(bool alreadySucceeded)
+        {
             var redis = RedisUtils.CreateClient();
             var storage = new RedisStorage(RedisUtils.GetHostAndPort(),
                 new RedisStorageOptions { Db = RedisUtils.GetDb() });
@@ -315,7 +320,7 @@ namespace Hangfire.Redis.Tests
             }
             subscriber.OnPerformed(null);
             // Exercise a second real performing job after the publisher has observed an exception.
-            LostRenewalOnlyFailsAJobThatIsStillProcessing(false);
+            AssertJobStateAfterLoss(false);
         }
 
         private static IDatabase CreateRenewalDatabase(Func<bool> renewal)
